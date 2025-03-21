@@ -1,2 +1,5 @@
 .ipynb_checkpoints
 .idea
+chkp
+data
+glove.840B.300d.txt
