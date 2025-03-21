@@ -70,14 +70,13 @@ image_prepare = tr.Compose([
     #   https://pytorch.org/vision/stable/transforms.html
     tr.Resize([256, 256], tr.InterpolationMode.BILINEAR),
     tr.RandomCrop([224, 224]),
-    tr.Resize([256, 256], tr.InterpolationMode.BILINEAR),
     tr.ToTensor(),
     tr.Normalize(mean=channel_mean, std=channel_std),
 ])
 
 image_prepare_val = tr.Compose([
     tr.ToPILImage(),
-    tr.Resize([256, 256], tr.InterpolationMode.BILINEAR),
+    tr.Resize([224, 224], tr.InterpolationMode.BILINEAR),
     tr.ToTensor(),
     tr.Normalize(mean=channel_mean, std=channel_std),
 ])
@@ -149,17 +148,172 @@ def get_val_dataloader(dataset, batch_size):
 
 # 2. Построение модели
 
-## Аргументы для общего класса
-init_kwargs = dict()
+class img_fe_class(nn.Module):
+    def __init__(self: int, 
+                 pretrained_model='resnet18',
+                 freeze_layers='all',
+                 unfreeze_last: int = 0):
+        super(img_fe_class, self).__init__()
+        if pretrained_model == 'resnet18':
+            weights = models.ResNet18_Weights.DEFAULT
+            base_model = models.resnet18(weights=weights)
+            base_features_dim = 512
+        elif pretrained_model == 'resnet34':
+            weights = models.ResNet34_Weights.DEFAULT
+            base_model = models.resnet34(weights=weights)
+            base_features_dim = 512
+        elif pretrained_model == 'resnet50':
+            weights = models.ResNet50_Weights.DEFAULT
+            base_model = models.resnet50(weights=weights)
+            base_features_dim = 2048
+        else:
+            raise ValueError(f"Unsupported model: {pretrained_model}")
 
-## Общий класс модели
+        self.img_feature_dim = base_features_dim
+        modules = list(base_model.children())[:-1]
+        self.backbone = nn.Sequential(*modules)
+
+        if unfreeze_last > 0:
+            children = list(self.backbone.children())
+            total = len(children)
+            for i, child in enumerate(children):
+                if i < total - unfreeze_last:
+                    for param in child.parameters():
+                        param.requires_grad = False
+        else:
+            if freeze_layers == 'all':
+                for param in self.backbone.parameters():
+                    param.requires_grad = False
+            elif freeze_layers == 'none':
+                pass
+
+    def forward(self, imgs):
+        
+        features = self.backbone(imgs)
+        features = features.reshape(features.size(0), -1)
+        return features
+
+from einops import rearrange
+
+class text_fe_class(nn.Module):
+    def __init__(self, 
+                 vocab_size, 
+                 hidden_dim=512, 
+                 img_feature_dim=512,
+                 num_layers=1, 
+                 dropout=0.1,
+                 rnn_type='rnn'):
+        super(text_fe_class, self).__init__()
+        
+        self.vocab_size = vocab_size
+        self.embed_dim = 300
+        self.hidden_dim = hidden_dim
+        self.img_feature_dim = img_feature_dim
+        self.num_layers = num_layers
+        self.rnn_type = rnn_type.lower()
+        
+        self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=self.embed_dim, padding_idx=tok_to_ind['<PAD>'])
+        '''self.embed.weight = nn.Parameter(
+            torch.from_numpy(glove_weights).to(dtype=self.embed.weight.dtype),
+            requires_grad=False,
+        )'''
+
+        if img_feature_dim != hidden_dim:
+            self.img_to_hidden = nn.Linear(img_feature_dim, hidden_dim)
+        else:
+            self.img_to_hidden = nn.Identity()
+
+        # Определение типа RNN
+        if self.rnn_type == 'lstm':
+            model = nn.LSTM
+        elif self.rnn_type == 'gru':
+            model = nn.GRU
+        else:
+            model = nn.RNN
+
+        self.rnn = model(
+                input_size=self.embed_dim,
+                hidden_size=self.hidden_dim,
+                num_layers=self.num_layers,
+                dropout=dropout if self.num_layers > 1 else 0,
+                batch_first=True
+            )
+
+    def forward(self, texts, img_features):
+        batch_size, num_captions, seq_len = texts.shape
+
+        # Преобразование фичей изображений в нужную размерность
+        img_features = self.img_to_hidden(img_features)  # [batch_size, hidden_dim]
+        
+        # Преобразование текстов для пакетной обработки
+        texts_flat = rearrange(texts, "bs cap seq -> (bs cap) seq")  # [batch_size * num_captions, seq_len]
+        
+        # Эмбеддинг текстовых токенов
+        embedded = self.embed(texts_flat)  # [batch_size * num_captions, seq_len, embed_dim]
+        
+        # Подготовка фичей изображений для использования в качестве начального скрытого состояния
+        # Сначала размножаем для каждого описания (caption)
+        h_0 = img_features.unsqueeze(1)  # [batch_size, 1, hidden_dim]
+        h_0 = h_0.repeat(1, num_captions, 1)  # [batch_size, num_captions, hidden_dim]
+        h_0 = rearrange(h_0, "bs cap hidden -> (bs cap) hidden")  # [batch_size * num_captions, hidden_dim]
+        
+        # Затем преобразуем для слоев и направлений RNN
+        h_0 = h_0.unsqueeze(0)  # [1, batch_size * num_captions, hidden_dim]
+        h_0 = h_0.repeat(self.num_layers, 1, 1)  # [num_layers * direction_factor, batch_size * num_captions, hidden_dim]
+        
+        # Обработка в зависимости от типа RNN
+        if self.rnn_type == 'lstm':
+            # Для LSTM нужно также состояние ячейки (c_0)
+            c_0 = torch.zeros_like(h_0)
+            outputs, _ = self.rnn(embedded, (h_0, c_0))
+        else:
+            # Для RNN/GRU нужно только скрытое состояние
+            outputs, _ = self.rnn(embedded, h_0)
+
+        # Преобразуем выходы обратно, чтобы включить размерность описаний
+        outputs = rearrange(outputs, "(bs cap) seq hidden -> bs cap seq hidden", 
+                           bs=batch_size, cap=num_captions)
+        
+        # Возвращаем только outputs, как ожидает тестовая ячейка
+        return outputs
+    
+from collections import OrderedDict
+
 class image_captioning_model(nn.Module):
-    def __init__(self, ...):
+    def __init__(self, 
+                 vocab_size, 
+                 pretrained_model='resnet18',
+                 freeze_layers_img='all',
+                 unfreeze_last=0,
+                 hidden_dim=512, 
+                 num_layers=1,
+                 rnn_type='rnn'):
         super(image_captioning_model, self).__init__()
-        ...
+        self.img_fe = img_fe_class(
+            pretrained_model=pretrained_model,
+            freeze_layers=freeze_layers_img,
+            unfreeze_last=unfreeze_last,
+        )
+        img_feature_dim = self.img_fe.img_feature_dim
+
+        self.text_fe = text_fe_class(
+            vocab_size=vocab_size,
+            hidden_dim=hidden_dim,
+            img_feature_dim=img_feature_dim,
+            num_layers=num_layers,
+            rnn_type=rnn_type,
+        )
+
+        self.fc = nn.Linear(hidden_dim, vocab_size)
+        
         
     def forward(self, img_batch, texts_batch):
-        ...
+        img_features = self.img_fe(img_batch)
+        text_features = self.text_fe(texts_batch, img_features)
+        return self.fc(text_features)
+
+## Аргументы для общего класса
+init_kwargs = dict('vocab_size' : len(get_vocab('./')[0].keys()))
 
 # 3. Обучение модели
 
