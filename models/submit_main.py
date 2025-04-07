@@ -7,27 +7,34 @@
 #   если требуется добавить ещё параметры, то добавляйте в конец и обязательно с установленными default-ами
 
 # 0. Все необходимые import-ы
-import torch
-from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import Dataset, DataLoader
 from torch import nn
 from typing import Dict, List, Optional, Tuple
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as tr
+from torchvision.transforms import InterpolationMode
+
+import torch
+import cv2
 import os
 import pandas as pd
-import cv2
-from torchvision import transforms as tr
-from torchvision import models
 import numpy as np
-import re
-import string
+from tqdm.auto import tqdm, trange
+# import matplotlib.pyplot as plt
 
-def tokenize(text):
-    text = text.lower()
-    text = re.sub(f"[{string.punctuation}]+\ *", " ", text)
-    text = text.strip()
-    text = text.split()
-    text = ['<BOS>'] + text + ['<EOS>']
-    return text
+import re
+
+import random
+
+from torchvision import models
+from torch import nn
+
+from einops import rearrange
+
+from collections import OrderedDict
+import torch.nn.functional as F
+
+from torch.optim.lr_scheduler import MultiStepLR
 
 # 1. Подготовка данных
 
@@ -38,45 +45,53 @@ def get_vocab(unzip_root: str) -> Tuple[Dict[str, int], Dict[int, str]]:
     """
     vocab_path = os.path.join(unzip_root, "vocab.tsv")
     vocab = pd.read_csv(vocab_path, sep='\t')
-    tok_to_ind = {
-        '<UNK>': 0,
-        '<BOS>': 1,
-        '<EOS>': 2,
-        '<PAD>': 3,
-    }
-    ind_to_tok = {
-        0: '<UNK>',
-        1: '<BOS>',
-        2: '<EOS>',
-        3: '<PAD>',
-    }
-    i = max(ind_to_tok.keys()) + 1
-    for _, row in vocab.iterrows():
-        if row['token'] not in tok_to_ind.keys():
-            tok_to_ind[row['token']] = i
-            ind_to_tok[i] = row['token']
-            i += 1
+    
+    ind_to_tok = vocab['0'].to_dict()
+    tok_to_ind = {tok: ind for ind, tok in ind_to_tok.items()}
+    
     return tok_to_ind, ind_to_tok
 
-def to_ids(text, tok_to_ind):
-    return list(map(lambda x: tok_to_ind[x] if x in tok_to_ind else tok_to_ind['<UNK>'], tokenize(text)))
+tok_to_ind, ind_to_tok = get_vocab('')
+vocab_size = len(tok_to_ind)
 
 channel_mean = np.array([0.485, 0.456, 0.406])
 channel_std = np.array([0.229, 0.224, 0.225])
 
 image_prepare = tr.Compose([
     tr.ToPILImage(),
-    # Любые преобразования, которые вы захотите:
-    #   https://pytorch.org/vision/stable/transforms.html
-    tr.Resize([256, 256], tr.InterpolationMode.BILINEAR),
-    tr.RandomCrop([224, 224]),
+    tr.Resize(256, interpolation=InterpolationMode.BILINEAR),
+    tr.RandomCrop(224),
+    tr.RandomHorizontalFlip(p=0.5),
+    tr.RandomVerticalFlip(p=0.1),
+    tr.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+    tr.RandomGrayscale(p=0.05),
+    tr.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
     tr.ToTensor(),
     tr.Normalize(mean=channel_mean, std=channel_std),
 ])
 
+
+def tokenize(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = text.strip()
+    tokens = re.split(r'\s+', text)
+    tokens = ['<BOS>'] + tokens + ['<EOS>']
+    return tokens
+
+def to_ids(text):
+    tokens = tokenize(text)
+    tok_to_ind, ind_to_tok = get_vocab("")
+    ids = [tok_to_ind.get(token, tok_to_ind['<UNK>']) for token in tokens]
+    return ids
+
+# Для валидации рекомендую использовать минимальное количество аугументаций, чтобы
+#  замеряться честно - изменения размера, нормализация (все случайные аугументации
+#  не делайте для валидации и обязательно для обучения делайте со средним в нуле)
 image_prepare_val = tr.Compose([
     tr.ToPILImage(),
-    tr.Resize([224, 224], tr.InterpolationMode.BILINEAR),
+    tr.Resize(256, interpolation=InterpolationMode.BILINEAR),
+    tr.CenterCrop(224),
     tr.ToTensor(),
     tr.Normalize(mean=channel_mean, std=channel_std),
 ])
@@ -89,58 +104,74 @@ class ImageCaptioningDataset(Dataset):
     """
     def __init__(self, imgs_path, captions_path, train=False):
         super(ImageCaptioningDataset).__init__()
-        # Читаем и записываем из файлов в память класса, чтобы быстро обращаться внутри датасета
-        # Если не хватает памяти на хранение всех изображений, то подгружайте прямо во время __getitem__, но это замедлит обучение
-        # Проведите всю предобработку, которую можно провести без потери вариативности датасета, здесь
-        self.train = train
         self.imgs_path = imgs_path
-        self.captions_path = captions_path
-
-        self.items = []
-
-        tok_to_ind, ind_to_tok = get_vocab("./")
-
-        df = pd.read_csv(captions_path, sep='\t')
-        for i, row in df.iterrows():
-          image = cv2.imread(os.path.join(imgs_path, row['img_id']))
-
-          captions = [to_ids(row[label], tok_to_ind) for label in df.keys() if label != 'img_id']
-          self.items.append({'image': image, 'captions': captions})
+        self.train = train
+        
+        self.captions_df = pd.read_csv(captions_path, sep='\t')
+        
+        self.caption_cols = [col for col in self.captions_df.columns if col.startswith('caption #')]
+        
+        self.transform = image_prepare if train else image_prepare_val
 
     def __getitem__(self, index):
-        item = self.items[index]
+        img_info = self.captions_df.iloc[index]
+        img_id = img_info['img_id']
 
-        if self.train:
-          img = image_prepare(item['image'])
-        else:
-          img = image_prepare_val(item['image'])
-
-        # Получаем предобработанное изображение (не забудьте отличие при train=True или train=False)
-        captions = item['captions']
-
-        # Берём все заголовки или только один случайный (случайность должна происходить при каждом вызове __getitem__,
+        img_path = os.path.join(self.imgs_path, img_id)
+        img = cv2.imread(img_path)
+        
+        img = self.transform(img)
+        
+        # Берём все заголовки или только один случайный (случайность должна происходить при каждом вызове __getitem__, 
         #  чтобы во время обучения вы в разных эпохах могли видеть разные заголовки для одного изображения)
-
-        return img, captions
+        if self.train:
+            caption_col = random.choice(self.caption_cols)
+            caption_text = img_info[caption_col]
+            caption_ids = to_ids(caption_text)
+            return img, caption_ids
+        
+        all_captions = []
+        for col in self.caption_cols:
+            caption_text = img_info[col]
+            caption_ids = to_ids(caption_text)
+            all_captions.append(caption_ids)
+        return img, all_captions
     
     def __len__(self):
-        return len(self.items)
+        return len(self.captions_df)
 
 ## Ваш даталоадер
 def collate_fn(batch):
-    # Функция получает на вход batch - представляет из себя List[el], где каждый el - один вызов __getitem__
-    #  вашего датасета
-    # На выход вы выдаёте то, что будет выдавать Dataloader на каждом next() из генератора - вы хотите иметь на выходе
-    #  несколько тензоров
+    images, captions = zip(*batch)
+    img_batch = torch.stack(images, dim=0)
+    
+    tok_to_ind, ind_to_tok = get_vocab("")
 
-    # Моё предложение по тому как должен выглядеть батч на выходе:
-    #   img_batch: [batch_size, num_channels, height, width] --> сложенные в батч изображения
-    #   captions_batch: [batch_size, num_captions_per_image, max_seq_len or local_max_seq_len] --> сложенные в
-    #       батч заголовки при помощи padding-а
-    tok_to_ind, ind_to_tok = get_vocab("./")
-    global_max_seq_len = np.max(list(map(lambda x: np.max([len(y) for y in x[1]]), batch)))
-    img_batch = torch.stack([img for img, cap in batch], dim=0)
-    captions_batch = torch.stack([torch.stack([nn.functional.pad(torch.Tensor(cap).to(torch.int32), (0, global_max_seq_len - len(cap) + 2), value=tok_to_ind['<PAD>']) for cap in caps], dim=0) for img, caps in batch], dim=0)
+    if isinstance(captions[0], list) and isinstance(captions[0][0], int):
+        # train        
+        max_length = max(len(caption) for caption in captions)
+        
+        padded_captions = []
+        for caption in captions:
+            padded = caption + [tok_to_ind['<PAD>']] * (max_length - len(caption))
+            padded_captions.append([padded])
+        
+        captions_batch = torch.tensor(padded_captions, dtype=torch.long)
+    else:
+        # val
+        max_length = max(len(caption) for caption_list in captions for caption in caption_list)
+        
+        padded_captions = []
+        for caption_list in captions:
+            padded_list = []
+            for caption in caption_list:
+                padded = caption + [tok_to_ind['<PAD>']] * (max_length - len(caption))
+                padded_list.append(padded)
+            padded_captions.append(padded_list)
+        
+        captions_batch = torch.tensor(padded_captions, dtype=torch.long)
+    
+    
     return img_batch, captions_batch
 
 def get_val_dataloader(dataset, batch_size):
@@ -148,53 +179,56 @@ def get_val_dataloader(dataset, batch_size):
 
 # 2. Построение модели
 
+## Аргументы для общего класса
+init_kwargs = dict()
+
 class img_fe_class(nn.Module):
-    def __init__(self: int, 
+    def __init__(self, 
                  pretrained_model='resnet18',
                  freeze_layers='all',
                  unfreeze_last: int = 0):
         super(img_fe_class, self).__init__()
-        if pretrained_model == 'resnet18':
-            weights = models.ResNet18_Weights.DEFAULT
-            base_model = models.resnet18()#models.resnet18(weights=weights)
-            base_features_dim = 512
-        elif pretrained_model == 'resnet34':
-            weights = models.ResNet34_Weights.DEFAULT
-            base_model = models.resnet34()#models.resnet34(weights=weights)
-            base_features_dim = 512
-        elif pretrained_model == 'resnet50':
-            weights = models.ResNet50_Weights.DEFAULT
-            base_model = models.resnet50()#models.resnet50(weights=weights)
-            base_features_dim = 2048
-        else:
-            raise ValueError(f"Unsupported model: {pretrained_model}")
+#         if pretrained_model == 'resnet18':
+#         weights = models.ResNet18_Weights.DEFAULT
+#         base_model = models.resnet18(weights=weights)
+        base_model = models.resnet18()
+        base_features_dim = 512
+#         elif pretrained_model == 'resnet34':
+#             weights = models.ResNet34_Weights.DEFAULT
+#             base_model = models.resnet34(weights=weights)
+#             base_features_dim = 512
+#         elif pretrained_model == 'resnet50':
+#             weights = models.ResNet50_Weights.DEFAULT
+#             base_model = models.resnet50(weights=weights)
+#             base_features_dim = 2048
+#         else:
+#             raise ValueError(f"Unsupported model: {pretrained_model}")
 
         self.img_feature_dim = base_features_dim
         modules = list(base_model.children())[:-1]
         self.backbone = nn.Sequential(*modules)
-
-        if unfreeze_last > 0:
-            children = list(self.backbone.children())
-            total = len(children)
-            for i, child in enumerate(children):
-                if i < total - unfreeze_last:
-                    for param in child.parameters():
-                        param.requires_grad = False
-        else:
-            if freeze_layers == 'all':
-                for param in self.backbone.parameters():
-                    param.requires_grad = False
-            elif freeze_layers == 'none':
-                pass
+        
+#         if unfreeze_last > 0:
+#             children = list(self.backbone.children())
+#             total = len(children)
+#             for i, child in enumerate(children):
+#                 if i < total - unfreeze_last:
+#                     for param in child.parameters():
+#                         param.requires_grad = False
+#         else:
+#             if freeze_layers == 'all':
+#                 for param in self.backbone.parameters():
+#                     param.requires_grad = False
+#             elif freeze_layers == 'none':
+#                 pass
 
     def forward(self, imgs):
-        
         features = self.backbone(imgs)
         features = features.reshape(features.size(0), -1)
         return features
 
-from einops import rearrange
-
+    
+    
 class text_fe_class(nn.Module):
     def __init__(self, 
                  vocab_size, 
@@ -210,20 +244,18 @@ class text_fe_class(nn.Module):
         self.hidden_dim = hidden_dim
         self.img_feature_dim = img_feature_dim
         self.num_layers = num_layers
-        self.rnn_type = rnn_type.lower()
-        tok_to_ind, ind_to_tok = get_vocab('./')
+        self.rnn_type = rnn_type
+        
+        tok_to_ind, ind_to_tok = get_vocab('')
+        
         self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=self.embed_dim, padding_idx=tok_to_ind['<PAD>'])
-        '''self.embed.weight = nn.Parameter(
-            torch.from_numpy(glove_weights).to(dtype=self.embed.weight.dtype),
-            requires_grad=False,
-        )'''
+#         self.embed.weight = nn.Parameter(
+#             torch.from_numpy(glove_weights).to(dtype=self.embed.weight.dtype),
+#             requires_grad=False,
+#         )
 
-        if img_feature_dim != hidden_dim:
-            self.img_to_hidden = nn.Linear(img_feature_dim, hidden_dim)
-        else:
-            self.img_to_hidden = nn.Identity()
+        self.img_to_hidden = nn.Linear(img_feature_dim, hidden_dim)
 
-        # Определение типа RNN
         if self.rnn_type == 'lstm':
             model = nn.LSTM
         elif self.rnn_type == 'gru':
@@ -238,50 +270,38 @@ class text_fe_class(nn.Module):
                 dropout=dropout if self.num_layers > 1 else 0,
                 batch_first=True
             )
-
+        
+        
     def forward(self, texts, img_features):
         batch_size, num_captions, seq_len = texts.shape
-
-        # Преобразование фичей изображений в нужную размерность
-        img_features = self.img_to_hidden(img_features)  # [batch_size, hidden_dim]
+        img_features = self.img_to_hidden(img_features)
         
-        # Преобразование текстов для пакетной обработки
-        texts_flat = rearrange(texts, "bs cap seq -> (bs cap) seq")  # [batch_size * num_captions, seq_len]
+        texts_flat = rearrange(texts, "bs cap seq -> (bs cap) seq")
         
-        # Эмбеддинг текстовых токенов
-        embedded = self.embed(texts_flat)  # [batch_size * num_captions, seq_len, embed_dim]
+        embedded = self.embed(texts_flat)
         
-        # Подготовка фичей изображений для использования в качестве начального скрытого состояния
-        # Сначала размножаем для каждого описания (caption)
-        h_0 = img_features.unsqueeze(1)  # [batch_size, 1, hidden_dim]
-        h_0 = h_0.repeat(1, num_captions, 1)  # [batch_size, num_captions, hidden_dim]
-        h_0 = rearrange(h_0, "bs cap hidden -> (bs cap) hidden")  # [batch_size * num_captions, hidden_dim]
+        h_0 = img_features.unsqueeze(1)
+        h_0 = h_0.repeat(1, num_captions, 1)
+        h_0 = rearrange(h_0, "bs cap hidden -> (bs cap) hidden")
         
-        # Затем преобразуем для слоев и направлений RNN
-        h_0 = h_0.unsqueeze(0)  # [1, batch_size * num_captions, hidden_dim]
-        h_0 = h_0.repeat(self.num_layers, 1, 1)  # [num_layers * direction_factor, batch_size * num_captions, hidden_dim]
+        h_0 = h_0.unsqueeze(0)
+        h_0 = h_0.repeat(self.num_layers, 1, 1)
         
-        # Обработка в зависимости от типа RNN
         if self.rnn_type == 'lstm':
-            # Для LSTM нужно также состояние ячейки (c_0)
             c_0 = torch.zeros_like(h_0)
             outputs, _ = self.rnn(embedded, (h_0, c_0))
         else:
-            # Для RNN/GRU нужно только скрытое состояние
             outputs, _ = self.rnn(embedded, h_0)
 
-        # Преобразуем выходы обратно, чтобы включить размерность описаний
         outputs = rearrange(outputs, "(bs cap) seq hidden -> bs cap seq hidden", 
                            bs=batch_size, cap=num_captions)
         
-        # Возвращаем только outputs, как ожидает тестовая ячейка
         return outputs
-    
-from collections import OrderedDict
+
 
 class image_captioning_model(nn.Module):
     def __init__(self, 
-                 vocab_size, 
+                 vocab_size=vocab_size, 
                  pretrained_model='resnet18',
                  freeze_layers_img='all',
                  unfreeze_last=0,
@@ -310,20 +330,17 @@ class image_captioning_model(nn.Module):
     def forward(self, img_batch, texts_batch):
         img_features = self.img_fe(img_batch)
         text_features = self.text_fe(texts_batch, img_features)
-        return self.fc(text_features)
-
-## Аргументы для общего класса
-init_kwargs = dict({'vocab_size' : len(get_vocab('./')[0].keys())})
+        text_features = self.fc(text_features)
+        return text_features
 
 # 3. Обучение модели
 
 def create_model_and_optimizer(model_class, model_params, optimizer, lr, device='cpu'):
     model = model_class(**model_params)
     model = model.to(device)
-
+    
     optimizer = optimizer([p for p in model.parameters() if p.requires_grad], lr=lr)
     return model, optimizer
-
 
 ## Сборка вашей модели с нужными параметрами и подгрукой весов из чекпоинта
 def get_model(unzip_root: str):
@@ -341,7 +358,7 @@ def get_model(unzip_root: str):
     model, optimizer = create_model_and_optimizer(
         model_class=image_captioning_model,
         model_params={
-            "vocab_size": init_kwargs['vocab_size'],
+            "vocab_size": vocab_size,
             "pretrained_model": pretrained_model,
             "hidden_dim": hidden_dim,
             "unfreeze_last": unfreeze_last,
@@ -352,36 +369,37 @@ def get_model(unzip_root: str):
         lr=1e-3
     )
     scheduler = MultiStepLR(optimizer, milestones=[30, 40, 50], gamma=0.7)
-
-    #     chkp_path = vocab_path = os.path.join(unzip_root, f"{model_name}.pt")
-    #     checkpoint = torch.load(chkp_path, weights_only=False)
-    #     model.load_state_dict(checkpoint['model_state_dict'])
+    
+#     chkp_path = vocab_path = os.path.join(unzip_root, f"{model_name}.pt")
+#     checkpoint = torch.load(chkp_path, weights_only=False)
+#     model.load_state_dict(checkpoint['model_state_dict'])
 
     return model
 
+
 # 4. Оценка результатов
-device = torch.device('cpu')
+
 ## Генерация предсказания по картинке
 def generate(
-        model,
-        image,
-        max_seq_len: Optional[int],
-        top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
-        greedy=False
+    model,
+    image,
+    max_seq_len: Optional[int],
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    greedy=False
 ):
     """
     Args:
         model (nn.Module): Модель из функции get_model
     """
     assert top_p is None or top_k is None, "Don't use top_p and top_k at the same time"
-
+    
     model.eval()
     tok_to_ind, ind_to_tok = get_vocab('')
 
     image = image_prepare_val(image)
     image = image.unsqueeze(0)
-
+    
     generated_tokens = [tok_to_ind['<BOS>']]
     with torch.no_grad():
         for _ in range(max_seq_len):
